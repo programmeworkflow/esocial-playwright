@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.5-seu-cert-digital';
+const VERSION = '1.6-direct-cert-url';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -168,55 +168,51 @@ async function doCertificateLogin(context, requestId) {
     await throwWithDebug(page, 'Não foi possível localizar o botão "Entrar com gov.br" na página de login do eSocial');
   }
 
-  // Step 2: wait for navigation to the gov.br SSO portal
+  // Step 2: wait for navigation to the gov.br SSO portal and capture
+  // the authorization_id — we use it to jump straight to the certificate
+  // challenge endpoint, bypassing the fragile "Seu certificado digital"
+  // button whose visibility depends on browser detection logic.
   log(requestId, 'waiting_for_gov_br_sso');
   try {
     await page.waitForURL(
-      (url) => /acesso\.gov\.br/.test(url.hostname) || /sso\.acesso\.gov\.br/.test(url.hostname),
+      (url) => /acesso\.gov\.br/.test(url.hostname),
       { timeout: 30_000 }
     );
     log(requestId, 'reached_gov_br_sso', page.url());
   } catch (_) {
     log(requestId, 'gov_br_sso_nav_timeout_url', page.url());
-    // Some variants keep the user on an interstitial — continue and try to click cert anyway
   }
 
-  // Step 3: inside gov.br SSO, click the "Certificado Digital" option
-  log(requestId, 'clicking_certificate_option_in_sso');
-  // gov.br often needs a moment for the JS to render the login options
-  await page.waitForLoadState('domcontentloaded').catch(() => {});
-  await page.waitForTimeout(2_000);
+  // Step 3: navigate DIRECTLY to the certificate SSO endpoint.
+  // The authorization_id is already in the URL or has to be extracted
+  // from the /authorize call. gov.br supports opening the cert-login
+  // URL by itself; this triggers the client-cert handshake immediately.
+  const currentUrl = new URL(page.url());
+  let authId = currentUrl.searchParams.get('authorization_id');
 
-  // gov.br labels the plain-cert option "Seu certificado digital" and
-  // the cloud option "Seu certificado digital em nuvem". We want the
-  // first one and must AVOID matching the nuvem variant.
-  const certCandidates = [
-    // Exact match excluding "em nuvem"
-    'text=/^\\s*Seu certificado digital\\s*$/',
-    // Element containing "Seu certificado digital" but not "em nuvem"
-    'xpath=//*[contains(translate(normalize-space(.), "CDS", "cds"), "seu certificado digital") and not(contains(., "em nuvem")) and not(contains(., "nuvem"))]',
-    // Fallback: any link/button with that text
-    'a:has-text("Seu certificado digital"):not(:has-text("em nuvem"))',
-    'button:has-text("Seu certificado digital"):not(:has-text("em nuvem"))',
-    // href-based fallback for the certificate SSO endpoint
-    '[href*="certificado.sso.acesso"]',
-    '[href*="/certificado"]',
-  ];
-
-  let certClicked = false;
-  for (const sel of certCandidates) {
-    const loc = page.locator(sel).first();
-    if (await loc.count().catch(() => 0)) {
-      try {
-        await loc.click({ timeout: 5_000 });
-        certClicked = true;
-        log(requestId, 'cert_option_clicked_via', sel);
-        break;
-      } catch (_) { /* try next */ }
-    }
+  // If we're on /authorize, the id is inside this page and the form
+  // submits to /login — follow that. If we're already on /login, the id
+  // is in the query. Otherwise, try to pull it from the page DOM.
+  if (!authId) {
+    try {
+      authId = await page.evaluate(() => {
+        const m = document.documentElement.outerHTML.match(/authorization_id=([A-Za-z0-9]+)/);
+        return m ? m[1] : null;
+      });
+    } catch (_) {}
   }
-  if (!certClicked) {
-    await throwWithDebug(page, 'Não foi possível localizar a opção "Certificado digital" no portal gov.br');
+
+  if (!authId) {
+    await throwWithDebug(page, 'Não foi possível extrair authorization_id do portal gov.br');
+  }
+
+  const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authId}`;
+  log(requestId, 'navigating_to_cert_endpoint', certUrl);
+  try {
+    await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  } catch (e) {
+    log(requestId, 'cert_endpoint_nav_error', e.message);
+    await throwWithDebug(page, `Falha ao navegar para o endpoint de certificado: ${e.message}`);
   }
 
   // Browser picks the pre-configured client certificate automatically.
