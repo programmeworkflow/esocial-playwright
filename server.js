@@ -65,19 +65,19 @@ async function launchBrowserWithCert(pfxBuffer, password) {
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
       '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    // The gov.br SSO flow bounces through several hosts before the
+    // client-cert handshake actually happens. If any one of them is
+    // missing from this list the browser silently aborts the TLS
+    // negotiation and the login fails. Cover every host the eSocial
+    // / gov.br / Receita chain is known to use.
     clientCertificates: [
-      {
-        origin: 'https://login.esocial.gov.br',
-        pfx: pfxBuffer,
-        passphrase: password,
-      },
-      // eSocial redirects to the empregador portal which may also
-      // challenge for a certificate — cover both hosts.
-      {
-        origin: 'https://www.esocial.gov.br',
-        pfx: pfxBuffer,
-        passphrase: password,
-      },
+      { origin: 'https://login.esocial.gov.br', pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://www.esocial.gov.br',   pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://certificado.acesso.gov.br', pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://sso.acesso.gov.br',    pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://acesso.gov.br',        pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://cav.receita.fazenda.gov.br', pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://cert.acesso.gov.br',   pfx: pfxBuffer, passphrase: password },
     ],
   });
 
@@ -103,15 +103,22 @@ async function doCertificateLogin(context, requestId) {
   const page = await context.newPage();
   page.setDefaultTimeout(60_000);
 
+  // Trace every navigation so we can see exactly where the flow stops
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) {
+      log(requestId, 'frame_nav', frame.url());
+    }
+  });
+  page.on('requestfailed', (req) => {
+    log(requestId, 'request_failed', `${req.method()} ${req.url()} → ${req.failure()?.errorText}`);
+  });
+
   log(requestId, 'navigating_login');
   await page.goto('https://login.esocial.gov.br/login.aspx', {
     waitUntil: 'domcontentloaded',
     timeout: 60_000,
   });
 
-  // The login page has multiple buttons; "Certificado Digital" is the
-  // one we want. The exact selector varies across gov.br updates, so
-  // we try several.
   log(requestId, 'clicking_certificate_button');
   const candidates = [
     'text=Certificado Digital',
@@ -147,10 +154,17 @@ async function doCertificateLogin(context, requestId) {
     );
   } catch (err) {
     const current = page.url();
+    let title = null;
+    let bodyText = null;
+    try { title = await page.title(); } catch (_) {}
+    try { bodyText = (await page.locator('body').innerText({ timeout: 2_000 })).slice(0, 500); } catch (_) {}
     log(requestId, 'redirect_timeout_current_url', current);
+    log(requestId, 'redirect_timeout_title', title);
+    log(requestId, 'redirect_timeout_body_excerpt', bodyText);
     throw new Error(
-      'Falha no login com certificado digital. Verifique se o certificado ' +
-      'é válido (ICP-Brasil, não vencido) e se a senha está correta.'
+      `Falha no login com certificado digital em ${current}. ` +
+      (title ? `Título: "${title}". ` : '') +
+      'Verifique se o certificado é válido (ICP-Brasil, não vencido) e se a senha está correta.'
     );
   }
 
