@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.3-gov-br-flow';
+const VERSION = '1.4-debug-all-errors';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -99,6 +99,26 @@ async function safeClose(browser, context) {
  * @param {import('playwright').BrowserContext} context
  * @param {string} requestId
  */
+async function captureDebug(page) {
+  const out = { url: null, title: null, bodyText: null, screenshot: null, htmlSnippet: null };
+  try { out.url = page.url(); } catch (_) {}
+  try { out.title = await page.title(); } catch (_) {}
+  try { out.bodyText = (await page.locator('body').innerText({ timeout: 2_000 })).slice(0, 1_500); } catch (_) {}
+  try {
+    const shot = await page.screenshot({ fullPage: true, type: 'png' });
+    out.screenshot = shot.toString('base64');
+  } catch (_) {}
+  try { out.htmlSnippet = (await page.content()).slice(0, 3_000); } catch (_) {}
+  return out;
+}
+
+async function throwWithDebug(page, message) {
+  const dbg = await captureDebug(page);
+  const err = new Error(`${message} (url=${dbg.url}, title="${dbg.title}")`);
+  err.debug = dbg;
+  throw err;
+}
+
 async function doCertificateLogin(context, requestId) {
   const page = await context.newPage();
   page.setDefaultTimeout(60_000);
@@ -144,7 +164,7 @@ async function doCertificateLogin(context, requestId) {
     }
   }
   if (!govBrClicked) {
-    throw new Error('Não foi possível localizar o botão "Entrar com gov.br" na página de login do eSocial');
+    await throwWithDebug(page, 'Não foi possível localizar o botão "Entrar com gov.br" na página de login do eSocial');
   }
 
   // Step 2: wait for navigation to the gov.br SSO portal
@@ -191,7 +211,7 @@ async function doCertificateLogin(context, requestId) {
     }
   }
   if (!certClicked) {
-    throw new Error('Não foi possível localizar a opção "Certificado digital" no portal gov.br');
+    await throwWithDebug(page, 'Não foi possível localizar a opção "Certificado digital" no portal gov.br');
   }
 
   // Browser picks the pre-configured client certificate automatically.
