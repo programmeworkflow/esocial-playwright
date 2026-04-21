@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.4-debug-all-errors';
+const VERSION = '1.5-seu-cert-digital';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -78,6 +78,7 @@ async function launchBrowserWithCert(pfxBuffer, password) {
       { origin: 'https://acesso.gov.br',        pfx: pfxBuffer, passphrase: password },
       { origin: 'https://cav.receita.fazenda.gov.br', pfx: pfxBuffer, passphrase: password },
       { origin: 'https://cert.acesso.gov.br',   pfx: pfxBuffer, passphrase: password },
+      { origin: 'https://certificado.sso.acesso.gov.br', pfx: pfxBuffer, passphrase: password },
     ],
   });
 
@@ -186,16 +187,20 @@ async function doCertificateLogin(context, requestId) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(2_000);
 
+  // gov.br labels the plain-cert option "Seu certificado digital" and
+  // the cloud option "Seu certificado digital em nuvem". We want the
+  // first one and must AVOID matching the nuvem variant.
   const certCandidates = [
-    'a:has-text("Certificado digital")',
-    'button:has-text("Certificado digital")',
-    'a:has-text("Certificado Digital")',
-    'button:has-text("Certificado Digital")',
-    'text=/Certificado\\s+[Dd]igital/',
-    '[href*="certificado"]',
-    '[data-testid*="certificado" i]',
-    '#cert-digital',
-    'a:has-text("Seu certificado digital")',
+    // Exact match excluding "em nuvem"
+    'text=/^\\s*Seu certificado digital\\s*$/',
+    // Element containing "Seu certificado digital" but not "em nuvem"
+    'xpath=//*[contains(translate(normalize-space(.), "CDS", "cds"), "seu certificado digital") and not(contains(., "em nuvem")) and not(contains(., "nuvem"))]',
+    // Fallback: any link/button with that text
+    'a:has-text("Seu certificado digital"):not(:has-text("em nuvem"))',
+    'button:has-text("Seu certificado digital"):not(:has-text("em nuvem"))',
+    // href-based fallback for the certificate SSO endpoint
+    '[href*="certificado.sso.acesso"]',
+    '[href*="/certificado"]',
   ];
 
   let certClicked = false;
