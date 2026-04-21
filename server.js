@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.2-debug-screenshot';
+const VERSION = '1.3-gov-br-flow';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -119,29 +119,79 @@ async function doCertificateLogin(context, requestId) {
     timeout: 60_000,
   });
 
-  log(requestId, 'clicking_certificate_button');
-  const candidates = [
-    'text=Certificado Digital',
-    'a:has-text("Certificado Digital")',
-    'button:has-text("Certificado Digital")',
-    '[href*="certificado"]',
-    '#btnCertificado',
+  // Step 1: the eSocial login page no longer exposes a "Certificado
+  // Digital" option directly — it only has an "Entrar com gov.br"
+  // button that redirects to sso.acesso.gov.br.
+  log(requestId, 'clicking_gov_br_button');
+  const govBrCandidates = [
+    'a:has-text("Entrar com gov.br")',
+    'button:has-text("Entrar com gov.br")',
+    'text=Entrar com gov.br',
+    'a:has-text("gov.br")',
+    '[href*="acesso.gov.br"]',
   ];
 
-  let clicked = false;
-  for (const sel of candidates) {
+  let govBrClicked = false;
+  for (const sel of govBrCandidates) {
     const loc = page.locator(sel).first();
     if (await loc.count().catch(() => 0)) {
       try {
         await loc.click({ timeout: 5_000 });
-        clicked = true;
-        log(requestId, 'cert_button_clicked_via', sel);
+        govBrClicked = true;
+        log(requestId, 'gov_br_button_clicked_via', sel);
         break;
       } catch (_) { /* try next */ }
     }
   }
-  if (!clicked) {
-    throw new Error('Não foi possível localizar o botão "Certificado Digital" na página de login');
+  if (!govBrClicked) {
+    throw new Error('Não foi possível localizar o botão "Entrar com gov.br" na página de login do eSocial');
+  }
+
+  // Step 2: wait for navigation to the gov.br SSO portal
+  log(requestId, 'waiting_for_gov_br_sso');
+  try {
+    await page.waitForURL(
+      (url) => /acesso\.gov\.br/.test(url.hostname) || /sso\.acesso\.gov\.br/.test(url.hostname),
+      { timeout: 30_000 }
+    );
+    log(requestId, 'reached_gov_br_sso', page.url());
+  } catch (_) {
+    log(requestId, 'gov_br_sso_nav_timeout_url', page.url());
+    // Some variants keep the user on an interstitial — continue and try to click cert anyway
+  }
+
+  // Step 3: inside gov.br SSO, click the "Certificado Digital" option
+  log(requestId, 'clicking_certificate_option_in_sso');
+  // gov.br often needs a moment for the JS to render the login options
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(2_000);
+
+  const certCandidates = [
+    'a:has-text("Certificado digital")',
+    'button:has-text("Certificado digital")',
+    'a:has-text("Certificado Digital")',
+    'button:has-text("Certificado Digital")',
+    'text=/Certificado\\s+[Dd]igital/',
+    '[href*="certificado"]',
+    '[data-testid*="certificado" i]',
+    '#cert-digital',
+    'a:has-text("Seu certificado digital")',
+  ];
+
+  let certClicked = false;
+  for (const sel of certCandidates) {
+    const loc = page.locator(sel).first();
+    if (await loc.count().catch(() => 0)) {
+      try {
+        await loc.click({ timeout: 5_000 });
+        certClicked = true;
+        log(requestId, 'cert_option_clicked_via', sel);
+        break;
+      } catch (_) { /* try next */ }
+    }
+  }
+  if (!certClicked) {
+    throw new Error('Não foi possível localizar a opção "Certificado digital" no portal gov.br');
   }
 
   // Browser picks the pre-configured client certificate automatically.
