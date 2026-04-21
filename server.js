@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.1-multihost';
+const VERSION = '1.2-debug-screenshot';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -156,16 +156,26 @@ async function doCertificateLogin(context, requestId) {
     const current = page.url();
     let title = null;
     let bodyText = null;
+    let screenshot = null;
+    let htmlSnippet = null;
     try { title = await page.title(); } catch (_) {}
-    try { bodyText = (await page.locator('body').innerText({ timeout: 2_000 })).slice(0, 500); } catch (_) {}
+    try { bodyText = (await page.locator('body').innerText({ timeout: 2_000 })).slice(0, 1_000); } catch (_) {}
+    try {
+      const shot = await page.screenshot({ fullPage: true, type: 'png' });
+      screenshot = shot.toString('base64');
+    } catch (_) {}
+    try { htmlSnippet = (await page.content()).slice(0, 3_000); } catch (_) {}
     log(requestId, 'redirect_timeout_current_url', current);
     log(requestId, 'redirect_timeout_title', title);
     log(requestId, 'redirect_timeout_body_excerpt', bodyText);
-    throw new Error(
+
+    const e = new Error(
       `Falha no login com certificado digital em ${current}. ` +
       (title ? `Título: "${title}". ` : '') +
       'Verifique se o certificado é válido (ICP-Brasil, não vencido) e se a senha está correta.'
     );
+    e.debug = { url: current, title, bodyText, screenshot, htmlSnippet };
+    throw e;
   }
 
   log(requestId, 'login_succeeded_url', page.url());
@@ -249,6 +259,7 @@ app.post('/login-test', async (req, res) => {
       ok: false,
       loggedIn: false,
       error: err.message || 'Erro ao autenticar no eSocial',
+      debug: err.debug || null,
     });
   } finally {
     await safeClose(browser, context);
