@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.6-direct-cert-url';
+const VERSION = '1.7-precise-click';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -109,7 +109,7 @@ async function captureDebug(page) {
     const shot = await page.screenshot({ fullPage: true, type: 'png' });
     out.screenshot = shot.toString('base64');
   } catch (_) {}
-  try { out.htmlSnippet = (await page.content()).slice(0, 3_000); } catch (_) {}
+  try { out.htmlSnippet = (await page.content()).slice(0, 15_000); } catch (_) {}
   return out;
 }
 
@@ -168,10 +168,7 @@ async function doCertificateLogin(context, requestId) {
     await throwWithDebug(page, 'Não foi possível localizar o botão "Entrar com gov.br" na página de login do eSocial');
   }
 
-  // Step 2: wait for navigation to the gov.br SSO portal and capture
-  // the authorization_id — we use it to jump straight to the certificate
-  // challenge endpoint, bypassing the fragile "Seu certificado digital"
-  // button whose visibility depends on browser detection logic.
+  // Step 2: wait for navigation to the gov.br SSO portal
   log(requestId, 'waiting_for_gov_br_sso');
   try {
     await page.waitForURL(
@@ -183,36 +180,85 @@ async function doCertificateLogin(context, requestId) {
     log(requestId, 'gov_br_sso_nav_timeout_url', page.url());
   }
 
-  // Step 3: navigate DIRECTLY to the certificate SSO endpoint.
-  // The authorization_id is already in the URL or has to be extracted
-  // from the /authorize call. gov.br supports opening the cert-login
-  // URL by itself; this triggers the client-cert handshake immediately.
-  const currentUrl = new URL(page.url());
-  let authId = currentUrl.searchParams.get('authorization_id');
+  // Let gov.br's JS finish hydrating the login options.
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(1500);
 
-  // If we're on /authorize, the id is inside this page and the form
-  // submits to /login — follow that. If we're already on /login, the id
-  // is in the query. Otherwise, try to pull it from the page DOM.
-  if (!authId) {
-    try {
-      authId = await page.evaluate(() => {
-        const m = document.documentElement.outerHTML.match(/authorization_id=([A-Za-z0-9]+)/);
-        return m ? m[1] : null;
-      });
-    } catch (_) {}
-  }
+  // Step 3: click "Seu certificado digital" in the gov.br SSO page.
+  // getByText with exact:true matches only leaf nodes whose full text
+  // equals the string, so it won't accidentally pick the "em nuvem"
+  // variant or a wrapping <div> that contains both.
+  log(requestId, 'clicking_seu_certificado_digital');
+  let certClicked = false;
 
-  if (!authId) {
-    await throwWithDebug(page, 'Não foi possível extrair authorization_id do portal gov.br');
-  }
-
-  const certUrl = `https://certificado.sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authId}`;
-  log(requestId, 'navigating_to_cert_endpoint', certUrl);
+  // 1) Try the safest: exact-text match
   try {
-    await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  } catch (e) {
-    log(requestId, 'cert_endpoint_nav_error', e.message);
-    await throwWithDebug(page, `Falha ao navegar para o endpoint de certificado: ${e.message}`);
+    const loc = page.getByText('Seu certificado digital', { exact: true }).first();
+    if (await loc.count() > 0) {
+      await loc.click({ timeout: 8_000 });
+      certClicked = true;
+      log(requestId, 'cert_clicked_via', 'getByText exact');
+    }
+  } catch (e) { log(requestId, 'getByText_attempt_failed', e.message); }
+
+  // 2) Fallback: target visible span/label/a leaves that contain the
+  //    exact phrase but not "em nuvem"
+  if (!certClicked) {
+    const leafSelectors = [
+      'span:text-is("Seu certificado digital")',
+      'a:text-is("Seu certificado digital")',
+      'button:text-is("Seu certificado digital")',
+      'div:text-is("Seu certificado digital")',
+      'label:text-is("Seu certificado digital")',
+    ];
+    for (const sel of leafSelectors) {
+      try {
+        const loc = page.locator(sel).first();
+        if (await loc.count() > 0) {
+          await loc.click({ timeout: 8_000 });
+          certClicked = true;
+          log(requestId, 'cert_clicked_via', sel);
+          break;
+        }
+      } catch (e) { log(requestId, 'leaf_selector_failed', `${sel}: ${e.message}`); }
+    }
+  }
+
+  // 3) Last resort: enumerate all elements with the phrase and click the
+  //    first one whose own text equals exactly "Seu certificado digital".
+  if (!certClicked) {
+    const clickedViaJs = await page.evaluate(() => {
+      const target = 'Seu certificado digital';
+      const all = Array.from(document.querySelectorAll('*'));
+      for (const el of all) {
+        const ownText = Array.from(el.childNodes)
+          .filter(n => n.nodeType === 3)
+          .map(n => n.textContent.trim())
+          .filter(Boolean)
+          .join(' ');
+        if (ownText === target) {
+          // climb up to the first clickable ancestor (a, button, [role=button], [onclick])
+          let anchor = el;
+          while (anchor && !(
+            anchor.tagName === 'A' ||
+            anchor.tagName === 'BUTTON' ||
+            anchor.getAttribute('role') === 'button' ||
+            anchor.hasAttribute('onclick')
+          )) anchor = anchor.parentElement;
+          (anchor || el).click();
+          return (anchor || el).outerHTML.slice(0, 300);
+        }
+      }
+      return null;
+    });
+    if (clickedViaJs) {
+      certClicked = true;
+      log(requestId, 'cert_clicked_via_js', clickedViaJs);
+    }
+  }
+
+  if (!certClicked) {
+    await throwWithDebug(page, 'Não foi possível clicar em "Seu certificado digital" no portal gov.br');
   }
 
   // Browser picks the pre-configured client certificate automatically.
