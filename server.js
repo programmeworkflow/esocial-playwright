@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.8-sst-funcionarios';
+const VERSION = '1.9-formaction-nav';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -184,81 +184,47 @@ async function doCertificateLogin(context, requestId) {
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.waitForTimeout(1500);
 
-  // Step 3: click "Seu certificado digital" in the gov.br SSO page.
-  // getByText with exact:true matches only leaf nodes whose full text
-  // equals the string, so it won't accidentally pick the "em nuvem"
-  // variant or a wrapping <div> that contains both.
-  log(requestId, 'clicking_seu_certificado_digital');
-  let certClicked = false;
+  // Step 3: navigate directly to the cert SSO endpoint.
+  //
+  // Prior versions tried to click the "Seu certificado digital" button,
+  // but gov.br renders that button with `disabled=""` and CSS class
+  // `loading` until its client-side JS fully hydrates. On Render's free
+  // tier (slow cold start) the click fires before hydration → nothing
+  // happens → 60s timeout waiting for the redirect that never comes.
+  //
+  // Robust path: read the button's formaction attribute (which carries
+  // the exact cert-SSO URL with the session's authorization_id) and do
+  // a plain page.goto(). If the button isn't there yet, wait up to 30s.
+  log(requestId, 'extracting_cert_formaction');
 
-  // 1) Try the safest: exact-text match
-  try {
-    const loc = page.getByText('Seu certificado digital', { exact: true }).first();
-    if (await loc.count() > 0) {
-      await loc.click({ timeout: 8_000 });
-      certClicked = true;
-      log(requestId, 'cert_clicked_via', 'getByText exact');
-    }
-  } catch (e) { log(requestId, 'getByText_attempt_failed', e.message); }
-
-  // 2) Fallback: target visible span/label/a leaves that contain the
-  //    exact phrase but not "em nuvem"
-  if (!certClicked) {
-    const leafSelectors = [
-      'span:text-is("Seu certificado digital")',
-      'a:text-is("Seu certificado digital")',
-      'button:text-is("Seu certificado digital")',
-      'div:text-is("Seu certificado digital")',
-      'label:text-is("Seu certificado digital")',
-    ];
-    for (const sel of leafSelectors) {
-      try {
-        const loc = page.locator(sel).first();
-        if (await loc.count() > 0) {
-          await loc.click({ timeout: 8_000 });
-          certClicked = true;
-          log(requestId, 'cert_clicked_via', sel);
-          break;
-        }
-      } catch (e) { log(requestId, 'leaf_selector_failed', `${sel}: ${e.message}`); }
-    }
-  }
-
-  // 3) Last resort: enumerate all elements with the phrase and click the
-  //    first one whose own text equals exactly "Seu certificado digital".
-  if (!certClicked) {
-    const clickedViaJs = await page.evaluate(() => {
-      const target = 'Seu certificado digital';
-      const all = Array.from(document.querySelectorAll('*'));
-      for (const el of all) {
-        const ownText = Array.from(el.childNodes)
-          .filter(n => n.nodeType === 3)
-          .map(n => n.textContent.trim())
-          .filter(Boolean)
-          .join(' ');
-        if (ownText === target) {
-          // climb up to the first clickable ancestor (a, button, [role=button], [onclick])
-          let anchor = el;
-          while (anchor && !(
-            anchor.tagName === 'A' ||
-            anchor.tagName === 'BUTTON' ||
-            anchor.getAttribute('role') === 'button' ||
-            anchor.hasAttribute('onclick')
-          )) anchor = anchor.parentElement;
-          (anchor || el).click();
-          return (anchor || el).outerHTML.slice(0, 300);
-        }
-      }
-      return null;
+  let certUrl = null;
+  for (let attempt = 0; attempt < 30 && !certUrl; attempt++) {
+    certUrl = await page.evaluate(() => {
+      const btn = document.querySelector('button#login-certificate[formaction], button[name="operation"][value="login-certificate"], [formaction*="certificado"]');
+      return btn ? btn.getAttribute('formaction') : null;
     });
-    if (clickedViaJs) {
-      certClicked = true;
-      log(requestId, 'cert_clicked_via_js', clickedViaJs);
-    }
+    if (!certUrl) await page.waitForTimeout(1000);
   }
 
-  if (!certClicked) {
-    await throwWithDebug(page, 'Não foi possível clicar em "Seu certificado digital" no portal gov.br');
+  if (certUrl) {
+    log(requestId, 'cert_formaction_found', certUrl);
+    await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    log(requestId, 'cert_goto_ok', page.url());
+  } else {
+    log(requestId, 'cert_formaction_not_found_fallback_to_click');
+    let certClicked = false;
+    try {
+      const loc = page.locator('button#login-certificate, button[value="login-certificate"], [name="operation"][value="login-certificate"]').first();
+      await loc.waitFor({ state: 'attached', timeout: 20_000 });
+      await loc.evaluate((el) => { el.removeAttribute('disabled'); el.classList.remove('loading'); });
+      await loc.click({ timeout: 8_000, force: true });
+      certClicked = true;
+      log(requestId, 'cert_clicked_force');
+    } catch (e) { log(requestId, 'force_click_failed', e.message); }
+
+    if (!certClicked) {
+      await throwWithDebug(page, 'Não foi possível navegar para o endpoint de certificado no gov.br');
+    }
   }
 
   // Browser picks the pre-configured client certificate automatically.
