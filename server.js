@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '2.1-wait-enabled-click';
+const VERSION = '2.2-text-based-click';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -184,48 +184,80 @@ async function doCertificateLogin(context, requestId) {
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.waitForTimeout(1500);
 
-  // Step 3: click the certificate login button AFTER it becomes enabled.
+  // Step 3: locate and click the "Seu certificado digital" option.
   //
-  // gov.br renders the button with disabled="" and CSS class `loading`
-  // while its client-side JS hydrates. Clicking while disabled is a
-  // no-op. Submitting the form programmatically (v2.0) POSTs to the
-  // formaction URL directly, but the gov.br cert endpoint requires
-  // session tokens set up by the button's JS handler — a bare POST
-  // returns 404. So: wait for the button to become enabled, then click
-  // normally (lets the gov.br JS handle the flow).
-  log(requestId, 'waiting_cert_button_enabled');
+  // gov.br's HTML structure changes over time. We locate the element
+  // by text ("Seu certificado digital", excluding "em nuvem"), walk up
+  // to the nearest clickable (a/button/[role=button]/form ancestor),
+  // wait for it to be enabled, then click and wait for navigation.
+  log(requestId, 'locating_cert_option');
 
-  await page.waitForSelector('button#login-certificate, button[value="login-certificate"]', { timeout: 45_000 }).catch(() => null);
+  await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
 
-  // Poll for the button to shed its disabled/loading state. Gov.br
-  // flips the attribute/class after a few seconds of JS hydration.
+  // Dump button info for debugging
+  const inventory = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+    return all
+      .map(el => ({
+        tag: el.tagName,
+        id: el.id || null,
+        classes: el.className.slice(0, 80) || null,
+        value: el.getAttribute('value') || null,
+        text: (el.textContent || '').trim().slice(0, 60),
+        disabled: el.hasAttribute('disabled'),
+        formaction: el.getAttribute('formaction') || null,
+      }))
+      .filter(x => /certificad/i.test(x.text) || /certificad/i.test(x.value || '') || /certificad/i.test(x.formaction || ''));
+  });
+  log(requestId, 'cert_candidates', JSON.stringify(inventory).slice(0, 600));
+
+  // Wait for the "certificate digital" option (not "em nuvem") to be present & enabled.
   try {
     await page.waitForFunction(() => {
-      const btn = document.querySelector('button#login-certificate, button[value="login-certificate"]');
-      if (!btn) return false;
-      if (btn.hasAttribute('disabled')) return false;
-      if (btn.classList.contains('loading')) return false;
-      return true;
-    }, { timeout: 45_000, polling: 500 });
-    log(requestId, 'cert_button_enabled');
+      const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+      const match = all.find(el => {
+        const t = (el.textContent || '').trim();
+        return /Seu certificado digital\b(?! em nuvem)/i.test(t);
+      });
+      if (!match) return false;
+      return !match.hasAttribute('disabled') && !match.classList.contains('loading');
+    }, { timeout: 60_000, polling: 500 });
+    log(requestId, 'cert_option_enabled');
   } catch (err) {
-    log(requestId, 'cert_button_never_enabled', err.message);
+    log(requestId, 'cert_option_wait_timeout', err.message);
   }
 
-  const certBtn = page.locator('button#login-certificate, button[value="login-certificate"]').first();
-  if (!(await certBtn.count())) {
-    await throwWithDebug(page, 'Botão de login por certificado não encontrado na página gov.br');
-  }
+  // Capture the URL *before* the click so we can detect navigation.
+  const urlBefore = page.url();
+  log(requestId, 'url_before_click', urlBefore);
 
-  // One more belt-and-suspenders: strip the attributes in case the button
-  // is still "loading" — click() with { force: true } bypasses actionability
-  // checks but still fires the normal event handler (not just submit()).
-  await certBtn.evaluate((el) => {
-    el.removeAttribute('disabled');
-    el.classList.remove('loading');
+  // Click via Playwright (dispatches real MouseEvent so gov.br's JS handler fires).
+  const clicked = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+    const match = all.find(el => {
+      const t = (el.textContent || '').trim();
+      return /Seu certificado digital\b(?! em nuvem)/i.test(t);
+    });
+    if (!match) return { ok: false, reason: 'element-not-found' };
+    match.removeAttribute('disabled');
+    match.classList.remove('loading');
+    match.scrollIntoView({ block: 'center' });
+    match.click();
+    return { ok: true, tag: match.tagName, text: (match.textContent || '').trim().slice(0, 60) };
   });
-  await certBtn.click({ timeout: 10_000, force: true });
-  log(requestId, 'cert_button_clicked');
+
+  if (!clicked.ok) {
+    await throwWithDebug(page, `Não encontrou "Seu certificado digital": ${clicked.reason}`);
+  }
+  log(requestId, 'cert_option_clicked', clicked);
+
+  // Wait for either a navigation or at least the URL to change.
+  try {
+    await page.waitForURL((url) => url.href !== urlBefore, { timeout: 30_000 });
+    log(requestId, 'url_changed_after_click', page.url());
+  } catch (err) {
+    log(requestId, 'no_navigation_after_click', page.url());
+  }
 
   // Browser picks the pre-configured client certificate automatically.
   // After the TLS handshake eSocial redirects to the empregador area.
