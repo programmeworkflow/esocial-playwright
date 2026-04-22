@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.9-formaction-nav';
+const VERSION = '2.0-form-submit';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -184,48 +184,46 @@ async function doCertificateLogin(context, requestId) {
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.waitForTimeout(1500);
 
-  // Step 3: navigate directly to the cert SSO endpoint.
+  // Step 3: submit the certificate login form.
   //
-  // Prior versions tried to click the "Seu certificado digital" button,
-  // but gov.br renders that button with `disabled=""` and CSS class
-  // `loading` until its client-side JS fully hydrates. On Render's free
-  // tier (slow cold start) the click fires before hydration → nothing
-  // happens → 60s timeout waiting for the redirect that never comes.
+  // The button is <button id="login-certificate" type="submit"
+  // formaction="..."> inside a form that carries CSRF token + cookies.
+  // Plain page.goto(formaction) does a GET — gov.br rejects it because
+  // the endpoint requires the POST body (CSRF + session). Clicking the
+  // button directly often fails because gov.br renders it disabled+loading
+  // on slow networks (Render free tier).
   //
-  // Robust path: read the button's formaction attribute (which carries
-  // the exact cert-SSO URL with the session's authorization_id) and do
-  // a plain page.goto(). If the button isn't there yet, wait up to 30s.
-  log(requestId, 'extracting_cert_formaction');
+  // Robust path: find the button, remove its disabled attr, then call
+  // `form.submit()` via JavaScript — this POSTs with all hidden inputs
+  // and the correct method. We also set form.action = formAction so the
+  // submission goes to certificado.sso.acesso.gov.br not the default.
+  log(requestId, 'submitting_cert_form');
 
-  let certUrl = null;
-  for (let attempt = 0; attempt < 30 && !certUrl; attempt++) {
-    certUrl = await page.evaluate(() => {
-      const btn = document.querySelector('button#login-certificate[formaction], button[name="operation"][value="login-certificate"], [formaction*="certificado"]');
-      return btn ? btn.getAttribute('formaction') : null;
-    });
-    if (!certUrl) await page.waitForTimeout(1000);
+  await page.waitForSelector('button#login-certificate, button[value="login-certificate"]', { timeout: 30_000 }).catch(() => null);
+
+  const submitResult = await page.evaluate(() => {
+    const btn =
+      document.querySelector('button#login-certificate[formaction]') ||
+      document.querySelector('button[name="operation"][value="login-certificate"]') ||
+      document.querySelector('[formaction*="certificado"]');
+    if (!btn) return { ok: false, reason: 'button-not-found' };
+    btn.removeAttribute('disabled');
+    btn.classList.remove('loading');
+    const form = btn.closest('form');
+    if (!form) return { ok: false, reason: 'form-not-found', btnHtml: btn.outerHTML.slice(0, 300) };
+    const formaction = btn.getAttribute('formaction');
+    if (formaction) form.action = formaction;
+    const method = (btn.getAttribute('formmethod') || form.method || 'POST').toUpperCase();
+    form.method = method;
+    form.submit();
+    return { ok: true, action: form.action, method };
+  });
+
+  if (!submitResult.ok) {
+    log(requestId, 'form_submit_failed', submitResult);
+    await throwWithDebug(page, `Não foi possível submeter o formulário de certificado: ${submitResult.reason}`);
   }
-
-  if (certUrl) {
-    log(requestId, 'cert_formaction_found', certUrl);
-    await page.goto(certUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    log(requestId, 'cert_goto_ok', page.url());
-  } else {
-    log(requestId, 'cert_formaction_not_found_fallback_to_click');
-    let certClicked = false;
-    try {
-      const loc = page.locator('button#login-certificate, button[value="login-certificate"], [name="operation"][value="login-certificate"]').first();
-      await loc.waitFor({ state: 'attached', timeout: 20_000 });
-      await loc.evaluate((el) => { el.removeAttribute('disabled'); el.classList.remove('loading'); });
-      await loc.click({ timeout: 8_000, force: true });
-      certClicked = true;
-      log(requestId, 'cert_clicked_force');
-    } catch (e) { log(requestId, 'force_click_failed', e.message); }
-
-    if (!certClicked) {
-      await throwWithDebug(page, 'Não foi possível navegar para o endpoint de certificado no gov.br');
-    }
-  }
+  log(requestId, 'form_submitted', submitResult);
 
   // Browser picks the pre-configured client certificate automatically.
   // After the TLS handshake eSocial redirects to the empregador area.
