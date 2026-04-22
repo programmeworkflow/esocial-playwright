@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '2.0-form-submit';
+const VERSION = '2.1-wait-enabled-click';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -184,46 +184,48 @@ async function doCertificateLogin(context, requestId) {
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.waitForTimeout(1500);
 
-  // Step 3: submit the certificate login form.
+  // Step 3: click the certificate login button AFTER it becomes enabled.
   //
-  // The button is <button id="login-certificate" type="submit"
-  // formaction="..."> inside a form that carries CSRF token + cookies.
-  // Plain page.goto(formaction) does a GET — gov.br rejects it because
-  // the endpoint requires the POST body (CSRF + session). Clicking the
-  // button directly often fails because gov.br renders it disabled+loading
-  // on slow networks (Render free tier).
-  //
-  // Robust path: find the button, remove its disabled attr, then call
-  // `form.submit()` via JavaScript — this POSTs with all hidden inputs
-  // and the correct method. We also set form.action = formAction so the
-  // submission goes to certificado.sso.acesso.gov.br not the default.
-  log(requestId, 'submitting_cert_form');
+  // gov.br renders the button with disabled="" and CSS class `loading`
+  // while its client-side JS hydrates. Clicking while disabled is a
+  // no-op. Submitting the form programmatically (v2.0) POSTs to the
+  // formaction URL directly, but the gov.br cert endpoint requires
+  // session tokens set up by the button's JS handler — a bare POST
+  // returns 404. So: wait for the button to become enabled, then click
+  // normally (lets the gov.br JS handle the flow).
+  log(requestId, 'waiting_cert_button_enabled');
 
-  await page.waitForSelector('button#login-certificate, button[value="login-certificate"]', { timeout: 30_000 }).catch(() => null);
+  await page.waitForSelector('button#login-certificate, button[value="login-certificate"]', { timeout: 45_000 }).catch(() => null);
 
-  const submitResult = await page.evaluate(() => {
-    const btn =
-      document.querySelector('button#login-certificate[formaction]') ||
-      document.querySelector('button[name="operation"][value="login-certificate"]') ||
-      document.querySelector('[formaction*="certificado"]');
-    if (!btn) return { ok: false, reason: 'button-not-found' };
-    btn.removeAttribute('disabled');
-    btn.classList.remove('loading');
-    const form = btn.closest('form');
-    if (!form) return { ok: false, reason: 'form-not-found', btnHtml: btn.outerHTML.slice(0, 300) };
-    const formaction = btn.getAttribute('formaction');
-    if (formaction) form.action = formaction;
-    const method = (btn.getAttribute('formmethod') || form.method || 'POST').toUpperCase();
-    form.method = method;
-    form.submit();
-    return { ok: true, action: form.action, method };
-  });
-
-  if (!submitResult.ok) {
-    log(requestId, 'form_submit_failed', submitResult);
-    await throwWithDebug(page, `Não foi possível submeter o formulário de certificado: ${submitResult.reason}`);
+  // Poll for the button to shed its disabled/loading state. Gov.br
+  // flips the attribute/class after a few seconds of JS hydration.
+  try {
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('button#login-certificate, button[value="login-certificate"]');
+      if (!btn) return false;
+      if (btn.hasAttribute('disabled')) return false;
+      if (btn.classList.contains('loading')) return false;
+      return true;
+    }, { timeout: 45_000, polling: 500 });
+    log(requestId, 'cert_button_enabled');
+  } catch (err) {
+    log(requestId, 'cert_button_never_enabled', err.message);
   }
-  log(requestId, 'form_submitted', submitResult);
+
+  const certBtn = page.locator('button#login-certificate, button[value="login-certificate"]').first();
+  if (!(await certBtn.count())) {
+    await throwWithDebug(page, 'Botão de login por certificado não encontrado na página gov.br');
+  }
+
+  // One more belt-and-suspenders: strip the attributes in case the button
+  // is still "loading" — click() with { force: true } bypasses actionability
+  // checks but still fires the normal event handler (not just submit()).
+  await certBtn.evaluate((el) => {
+    el.removeAttribute('disabled');
+    el.classList.remove('loading');
+  });
+  await certBtn.click({ timeout: 10_000, force: true });
+  log(requestId, 'cert_button_clicked');
 
   // Browser picks the pre-configured client certificate automatically.
   // After the TLS handshake eSocial redirects to the empregador area.
