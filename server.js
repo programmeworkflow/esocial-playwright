@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '2.2-text-based-click';
+const VERSION = '2.3-native-click';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -231,31 +231,35 @@ async function doCertificateLogin(context, requestId) {
   const urlBefore = page.url();
   log(requestId, 'url_before_click', urlBefore);
 
-  // Click via Playwright (dispatches real MouseEvent so gov.br's JS handler fires).
-  const clicked = await page.evaluate(() => {
-    const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-    const match = all.find(el => {
-      const t = (el.textContent || '').trim();
-      return /Seu certificado digital\b(?! em nuvem)/i.test(t);
-    });
-    if (!match) return { ok: false, reason: 'element-not-found' };
-    match.removeAttribute('disabled');
-    match.classList.remove('loading');
-    match.scrollIntoView({ block: 'center' });
-    match.click();
-    return { ok: true, tag: match.tagName, text: (match.textContent || '').trim().slice(0, 60) };
+  // Native Playwright click — generates `isTrusted: true` events via
+  // Chrome DevTools Protocol, so gov.br's JS handlers (which often
+  // check event trust) fire correctly. Text-based locator with exact
+  // match of "Seu certificado digital" (excluding "em nuvem").
+  const certLocator = page.locator('button, a, [role="button"]').filter({
+    hasText: /^\s*Seu certificado digital\s*$/,
+  }).first();
+
+  if (!(await certLocator.count())) {
+    await throwWithDebug(page, 'Locator "Seu certificado digital" (não "em nuvem") não resolveu no DOM');
+  }
+
+  // Strip disabled/loading just in case — without waiting for actionability.
+  await certLocator.evaluate((el) => {
+    el.removeAttribute('disabled');
+    el.classList.remove('loading');
+    el.scrollIntoView({ block: 'center' });
   });
 
-  if (!clicked.ok) {
-    await throwWithDebug(page, `Não encontrou "Seu certificado digital": ${clicked.reason}`);
-  }
-  log(requestId, 'cert_option_clicked', clicked);
+  // force:true skips actionability checks but still fires real MouseEvent.
+  // Wait for navigation OR URL change in parallel.
+  const [navOk] = await Promise.all([
+    page.waitForURL((url) => url.href !== urlBefore, { timeout: 30_000 }).then(() => true).catch(() => false),
+    certLocator.click({ force: true, timeout: 10_000 }).then(() => log(requestId, 'native_click_dispatched')),
+  ]);
 
-  // Wait for either a navigation or at least the URL to change.
-  try {
-    await page.waitForURL((url) => url.href !== urlBefore, { timeout: 30_000 });
+  if (navOk) {
     log(requestId, 'url_changed_after_click', page.url());
-  } catch (err) {
+  } else {
     log(requestId, 'no_navigation_after_click', page.url());
   }
 
