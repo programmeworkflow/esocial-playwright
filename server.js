@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '2.3-native-click';
+const VERSION = '2.4-stealth';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -56,6 +56,8 @@ async function launchBrowserWithCert(pfxBuffer, password) {
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
     ],
   });
 
@@ -65,6 +67,11 @@ async function launchBrowserWithCert(pfxBuffer, password) {
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
       '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1366, height: 768 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    javaScriptEnabled: true,
     // The gov.br SSO flow bounces through several hosts before the
     // client-cert handshake actually happens. If any one of them is
     // missing from this list the browser silently aborts the TLS
@@ -80,6 +87,29 @@ async function launchBrowserWithCert(pfxBuffer, password) {
       { origin: 'https://cert.acesso.gov.br',   pfx: pfxBuffer, passphrase: password },
       { origin: 'https://certificado.sso.acesso.gov.br', pfx: pfxBuffer, passphrase: password },
     ],
+  });
+
+  // Stealth: hide automation fingerprints that gov.br (or any bot
+  // detection) can read via navigator.* to silently drop our clicks.
+  await context.addInitScript(() => {
+    // navigator.webdriver — dead giveaway of Playwright/Selenium
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // Plugins — real browsers have at least 1-3; headless Chromium has 0
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Plugin', filename: '' })),
+    });
+    // Languages — sometimes probed
+    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
+    // chrome object — headless doesn't have it
+    if (!window.chrome) window.chrome = { runtime: {} };
+    // Permissions — some checks probe notifications permission
+    const origQuery = window.navigator.permissions?.query;
+    if (origQuery) {
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(parameters);
+    }
   });
 
   return { browser, context };
@@ -243,23 +273,35 @@ async function doCertificateLogin(context, requestId) {
     await throwWithDebug(page, 'Locator "Seu certificado digital" (não "em nuvem") não resolveu no DOM');
   }
 
-  // Strip disabled/loading just in case — without waiting for actionability.
+  // Strip disabled/loading + scroll into view.
   await certLocator.evaluate((el) => {
     el.removeAttribute('disabled');
     el.classList.remove('loading');
     el.scrollIntoView({ block: 'center' });
   });
+  await page.waitForTimeout(500);
 
-  // force:true skips actionability checks but still fires real MouseEvent.
-  // Wait for navigation OR URL change in parallel.
-  const [navOk] = await Promise.all([
-    page.waitForURL((url) => url.href !== urlBefore, { timeout: 30_000 }).then(() => true).catch(() => false),
-    certLocator.click({ force: true, timeout: 10_000 }).then(() => log(requestId, 'native_click_dispatched')),
-  ]);
+  // Use mouse.click at the element's real coordinates — this dispatches
+  // pointerdown / mousedown / pointerup / mouseup / click in the exact
+  // sequence a human produces. Some SPAs ignore naked .click() but
+  // react to the full mouse-event sequence.
+  const box = await certLocator.boundingBox();
+  if (!box) {
+    await throwWithDebug(page, 'BoundingBox do elemento "Seu certificado digital" não disponível');
+  }
+  log(requestId, 'cert_option_bbox', `x=${Math.round(box.x)} y=${Math.round(box.y)} w=${Math.round(box.width)} h=${Math.round(box.height)}`);
 
-  if (navOk) {
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.waitForTimeout(100);
+  await page.mouse.click(cx, cy, { delay: 60 });
+  log(requestId, 'mouse_click_dispatched');
+
+  try {
+    await page.waitForURL((url) => url.href !== urlBefore, { timeout: 30_000 });
     log(requestId, 'url_changed_after_click', page.url());
-  } else {
+  } catch (err) {
     log(requestId, 'no_navigation_after_click', page.url());
   }
 
