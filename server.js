@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 8080;
-const VERSION = '1.7-precise-click';
+const VERSION = '1.8-sst-funcionarios';
 
 // ──────────────────────────────────────────────────────────────
 // Small logger helper so every step is traceable in Render logs
@@ -385,18 +385,186 @@ app.post('/login-test', async (req, res) => {
 });
 
 /**
- * POST /fetch-funcionarios
- * Body: { certificate, password, cnpj }
+ * Switches from the default profile to "Procurador de Pessoa Jurídica - CNPJ"
+ * and enters the SST (Segurança e Saúde no Trabalho) module for the given CNPJ.
  *
- * TODO: The exact navigation path inside the empregador portal to
- * list active/dismissed employees still needs to be mapped by the
- * user (menu path + DOM selectors). For now this endpoint performs
- * the login, verifies we reached the empregador area, and returns
- * an empty list with a notice.
+ * After a successful call, the page is at https://frontend.esocial.gov.br/sst
+ * with the empregador header showing the chosen CNPJ.
+ */
+async function switchToProcuradorPJ(page, cnpjDigits, requestId) {
+  log(requestId, 'switching_to_procurador_pj', { cnpj: cnpjDigits });
+
+  await page.goto('https://www.esocial.gov.br/portal/Home/Index?trocarPerfil=true', {
+    waitUntil: 'domcontentloaded',
+    timeout: 45_000,
+  });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const perfilSelect = page.locator('select').filter({ hasText: /Titular|Procurador/ }).first();
+  if (!(await perfilSelect.count())) {
+    await throwWithDebug(page, 'Dropdown "Selecione o seu perfil" não encontrado');
+  }
+  await perfilSelect.selectOption({ label: 'Procurador de Pessoa Jurídica - CNPJ' });
+  log(requestId, 'perfil_procurador_pj_selected');
+  await page.waitForTimeout(1000);
+
+  let cnpjInput = page.getByLabel(/Informe o CNPJ representado/i).first();
+  if (!(await cnpjInput.count())) {
+    cnpjInput = page.locator('label:has-text("CNPJ representado") + input, label:has-text("CNPJ") ~ input').first();
+  }
+  if (!(await cnpjInput.count())) {
+    cnpjInput = page.locator('input[type="text"]:visible').filter({ hasNot: page.locator('[readonly]') }).first();
+  }
+  if (!(await cnpjInput.count())) {
+    await throwWithDebug(page, 'Campo de CNPJ representado não apareceu após escolher Procurador PJ');
+  }
+  const cnpjFormatted = `${cnpjDigits.slice(0,2)}.${cnpjDigits.slice(2,5)}.${cnpjDigits.slice(5,8)}/${cnpjDigits.slice(8,12)}-${cnpjDigits.slice(12,14)}`;
+  await cnpjInput.fill(cnpjFormatted);
+  log(requestId, 'cnpj_filled', cnpjFormatted);
+
+  const verificarBtn = page.locator('button, input[type="submit"], input[type="button"]').filter({ hasText: /^Verificar$/i }).first();
+  await verificarBtn.click();
+  log(requestId, 'verificar_clicked');
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const bodyText = await page.locator('body').innerText().catch(() => '');
+  if (/não.*encontrad|inválid|sem permiss|sem procura|não autoriz/i.test(bodyText)) {
+    await throwWithDebug(page, `CNPJ ${cnpjFormatted} não autorizado via procuração ou inválido`);
+  }
+
+  const sstModule = page.locator('a, button, div').filter({ hasText: /^Segurança e Saúde no Trabalho$/ }).first();
+  if (!(await sstModule.count())) {
+    const anySst = page.locator('text=/Segurança.*Saúde.*Trabalho/i').first();
+    if (!(await anySst.count())) {
+      await throwWithDebug(page, 'Módulo SST não disponível para esse CNPJ. Procuração pode não incluir SST.');
+    }
+    await anySst.click();
+  } else {
+    await sstModule.click();
+  }
+  log(requestId, 'sst_module_clicked');
+
+  await page.waitForURL((url) => /frontend\.esocial\.gov\.br\/sst/.test(url.href), { timeout: 45_000 })
+    .catch(async () => {
+      await throwWithDebug(page, 'Não redirecionou para frontend.esocial.gov.br/sst após clicar em SST');
+    });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  log(requestId, 'on_sst_frontend', page.url());
+}
+
+/**
+ * On /sst/gestaoTrabalhadores extracts the list of trabalhadores.
+ * Two modes are possible:
+ *   - "lista" mode (small companies): all workers are displayed in blocks
+ *   - "cpf" mode (large companies): only a CPF input is shown; the caller
+ *     must supply a list of CPFs and we query one by one.
+ *
+ * If `cpfList` is provided, forces CPF-by-CPF mode regardless of what the
+ * page shows initially.
+ */
+async function scrapeGestaoTrabalhadores(page, requestId, cpfList = null) {
+  log(requestId, 'navigating_to_gestao_trabalhadores');
+  await page.goto('https://frontend.esocial.gov.br/sst/gestaoTrabalhadores', {
+    waitUntil: 'domcontentloaded',
+    timeout: 45_000,
+  });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const pageText = await page.locator('body').innerText().catch(() => '');
+
+  if (/Não há empregado.*para exibi/i.test(pageText)) {
+    log(requestId, 'empty_company');
+    return { mode: 'empty', trabalhadores: [] };
+  }
+
+  const listaHeader = await page.locator('text=/Lista de Trabalhadores/i').count();
+  const cpfInput = page.locator('input[placeholder*="CPF" i], input[id*="cpf" i], input[name*="cpf" i]').first();
+  const hasCpfInput = await cpfInput.count();
+
+  if (listaHeader > 0 && (!cpfList || cpfList.length === 0)) {
+    log(requestId, 'extracting_bloco_list');
+    const trabalhadores = await page.evaluate(() => {
+      const cpfRegex = /(\d{3}\.\d{3}\.\d{3}-\d{2})/;
+      const uniq = new Map();
+      const allBlocks = Array.from(document.querySelectorAll('div, article, section, li'));
+      for (const block of allBlocks) {
+        const txt = (block.innerText || '').trim();
+        if (!txt) continue;
+        const cpfMatch = txt.match(cpfRegex);
+        if (!cpfMatch) continue;
+        if (block.querySelectorAll('div,article,section,li').length > 3) continue;
+        const lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
+        const nomeLine = lines.find(l => !cpfRegex.test(l) && l.length > 3 && l.length < 100);
+        const cpf = cpfMatch[1].replace(/\D/g, '');
+        if (!uniq.has(cpf) && nomeLine) {
+          uniq.set(cpf, { nome: nomeLine, cpf, situacao: 'ativo' });
+        }
+      }
+      return Array.from(uniq.values());
+    });
+    log(requestId, 'bloco_list_extracted', { total: trabalhadores.length });
+    return { mode: 'lista', trabalhadores };
+  }
+
+  if (hasCpfInput && cpfList && cpfList.length > 0) {
+    log(requestId, 'querying_by_cpf', { total: cpfList.length });
+    const trabalhadores = [];
+    for (const cpfRaw of cpfList) {
+      const cpf = String(cpfRaw).replace(/\D/g, '');
+      if (cpf.length !== 11) continue;
+      try {
+        await cpfInput.fill('');
+        await cpfInput.fill(cpf);
+        await cpfInput.press('Enter');
+        await page.waitForLoadState('networkidle').catch(() => {});
+        await page.waitForTimeout(1200);
+
+        const result = await page.evaluate((cpf) => {
+          const body = document.body.innerText || '';
+          const notFound = /não (foi |)encontrad|sem registro|não há dados/i.test(body);
+          if (notFound) return { cpf, situacao: 'nao_encontrado', nome: null };
+          const nameMatch = body.match(/([A-ZÁ-Ú][A-Za-zÀ-ÿ' ]+[A-Za-zÀ-ÿ])(?=\s*\n|\s*\d{3}\.\d{3}\.\d{3})/);
+          const situacaoMatch = body.match(/Situa[cç][aã]o[:\s]+(\w+)/i);
+          return {
+            cpf,
+            nome: nameMatch ? nameMatch[1].trim() : null,
+            situacao: situacaoMatch ? situacaoMatch[1].toLowerCase() : 'ativo',
+          };
+        }, cpf);
+        trabalhadores.push(result);
+      } catch (err) {
+        trabalhadores.push({ cpf, situacao: 'erro', error: err.message.slice(0, 150) });
+      }
+    }
+    return { mode: 'cpf-a-cpf', trabalhadores };
+  }
+
+  if (hasCpfInput && (!cpfList || cpfList.length === 0)) {
+    return {
+      mode: 'cpf-input-required',
+      trabalhadores: [],
+      notice: 'Empresa não lista trabalhadores automaticamente. Forneça cpfList no body da requisição.',
+    };
+  }
+
+  await throwWithDebug(page, 'Página /sst/gestaoTrabalhadores em estado inesperado');
+}
+
+/**
+ * POST /fetch-funcionarios
+ * Body: { certificate, password, cnpj, cpfList? }
+ *
+ * - `cpfList` é opcional. Sem ela, o serviço tenta extrair a lista em blocos
+ *   (modo "empresa pequena"). Se o portal não listar automaticamente,
+ *   retorna mode='cpf-input-required' indicando que precisa de uma lista.
+ * - Com `cpfList`, consulta CPF a CPF e retorna situação de cada um.
  */
 app.post('/fetch-funcionarios', async (req, res) => {
   const requestId = newRequestId();
-  const { certificate, password, cnpj } = req.body || {};
+  const { certificate, password, cnpj, cpfList } = req.body || {};
 
   if (!certificate || !password || !cnpj) {
     return res.status(400).json({
@@ -418,48 +586,33 @@ app.post('/fetch-funcionarios', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Certificado base64 inválido' });
   }
 
-  log(requestId, 'fetch_funcionarios_start', { cnpj: cleanCnpj });
+  log(requestId, 'fetch_funcionarios_start', { cnpj: cleanCnpj, cpfListCount: cpfList?.length || 0 });
 
   let browser, context;
   try {
     ({ browser, context } = await launchBrowserWithCert(pfxBuffer, password));
 
-    // Give data-fetch more headroom than login-only
     const page = await doCertificateLogin(context, requestId);
     page.setDefaultTimeout(90_000);
 
-    // ────────────────────────────────────────────────────────
-    // TODO: implement empresa selection + funcionarios scrape.
-    //
-    // Expected steps (to be confirmed by user against real portal):
-    //   1. On the empregador home, click "Selecionar Empregador"
-    //      (or similar) and search by CNPJ = cleanCnpj.
-    //   2. Navigate to: Trabalhador → Consultar Trabalhadores
-    //      (exact menu labels may differ).
-    //   3. Toggle filters to show BOTH active and dismissed.
-    //   4. Paginate through the results table, extracting:
-    //        cpf, nome, matricula, dataAdmissao, situacao,
-    //        dataDesligamento (if desligado), cargo.
-    //
-    // Until that UI map is nailed down we return an empty list so
-    // callers can exercise the pipeline end-to-end.
-    // ────────────────────────────────────────────────────────
-    log(requestId, 'funcionarios_fetch_not_yet_implemented');
+    await switchToProcuradorPJ(page, cleanCnpj, requestId);
+    const result = await scrapeGestaoTrabalhadores(page, requestId, cpfList || null);
+
+    log(requestId, 'fetch_funcionarios_done', { mode: result.mode, total: result.trabalhadores.length });
 
     return res.json({
       ok: true,
-      funcionarios: [],
-      notice:
-        'Login efetuado com sucesso, mas a extração de funcionários ainda ' +
-        'não foi mapeada. Forneça o caminho exato (menus + seletores) da ' +
-        'listagem no portal eSocial para finalizar a implementação.',
       cnpj: cleanCnpj,
+      mode: result.mode,
+      funcionarios: result.trabalhadores,
+      notice: result.notice || null,
     });
   } catch (err) {
     log(requestId, 'fetch_funcionarios_error', err.message);
     return res.status(500).json({
       ok: false,
       error: err.message || 'Erro ao buscar funcionários',
+      debug: err.debug || null,
     });
   } finally {
     await safeClose(browser, context);
